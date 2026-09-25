@@ -72,3 +72,25 @@ def test_validate_tool_choice_without_model_is_still_a_400():
         validate_chat_completion_tool_choice({"type": "bogus"})
     assert exc_info.value.status_code == 400
     assert exc_info.value.model == ""
+
+
+def test_validate_tool_choice_allowed_tools_passthrough():
+    """OpenAI gpt-5+ allowed_tools shape is valid chat-completions tool_choice; pass it through unchanged."""
+    tool_choice = {
+        "type": "allowed_tools",
+        "allowed_tools": {"mode": "required", "tools": [{"type": "function", "function": {"name": "x"}}]},
+    }
+    assert validate_chat_completion_tool_choice(tool_choice, model=MODEL) == tool_choice
+
+
+def test_validate_tool_choice_allowed_tools_auto_mode_passthrough():
+    tool_choice = {"type": "allowed_tools", "allowed_tools": {"mode": "auto", "tools": []}}
+    assert validate_chat_completion_tool_choice(tool_choice, model=MODEL) == tool_choice
+
+
+def test_validate_tool_choice_allowed_tools_missing_payload_is_400():
+    """type=allowed_tools without the allowed_tools payload is still a caller error."""
+    tool_choice = {"type": "allowed_tools"}
+    with pytest.raises(litellm.BadRequestError, match="Invalid tool choice") as exc:
+        validate_chat_completion_tool_choice(tool_choice, model=MODEL)
+    assert exc.value.status_code == 400
