@@ -186,6 +186,34 @@ def is_otlp_trace_request(request: Request) -> bool:
     return request.method == "POST" and get_route_path(request.scope) == "/v1/traces"
 
 
+def _parse_form_metadata_field(form_body: dict) -> None:
+    """
+    Parse the string ``metadata`` field of a form body back into an object.
+
+    ``request.form()`` hands every field back as a string, so a JSON ``metadata``
+    object arrives as text and has to be parsed back. An empty field means the
+    caller sent nothing, so it is left alone -- that matches how the JSON branch
+    treats ``metadata: ""``. A non-empty value that will not parse is a client
+    error and must raise a ProxyException(400) like every other body-parse failure
+    in ``_read_request_body``: letting the raw JSONDecodeError escape skips the
+    deferred 400 in ``_read_request_body_deferring_parse_failure`` and surfaces to
+    the caller as a 500.
+    """
+    raw_metadata: Final = form_body["metadata"]
+    if not raw_metadata.strip():
+        return
+    try:
+        form_body["metadata"] = json.loads(raw_metadata)
+    except json.JSONDecodeError as e:
+        verbose_proxy_logger.error("Invalid metadata field in form payload: %s", e)
+        raise ProxyException(
+            message=f"Invalid metadata field: {e}",
+            type="invalid_request_error",
+            param="metadata",
+            code=status.HTTP_400_BAD_REQUEST,
+        )
+
+
 async def _read_request_body(request: Request | None) -> dict:
     """
     Safely read the request body and parse it as JSON.
@@ -235,7 +263,7 @@ async def _read_request_body(request: Request | None) -> dict:
                 )
             parsed_body = dict(form_data)
             if "metadata" in parsed_body and isinstance(parsed_body["metadata"], str):
-                parsed_body["metadata"] = json.loads(parsed_body["metadata"])
+                _parse_form_metadata_field(parsed_body)
         else:
             # Read the request body
             body: Final = await request.body()

@@ -273,9 +273,13 @@ async def test_form_data_with_json_metadata():
 @pytest.mark.asyncio
 async def test_form_data_with_invalid_json_metadata():
     """
-    Test that form data with invalid JSON in metadata field raises an exception.
+    Test that malformed metadata in a form body is rejected as a 400.
 
-    This tests error handling when the metadata field contains malformed JSON.
+    Every other unparsable body in ``_read_request_body`` -- malformed
+    multipart, malformed JSON -- leaves as a ProxyException(400). A raw
+    JSONDecodeError leaking out of the metadata conversion skips the
+    deferred-400 handling in the auth pre-read (which only catches
+    ProxyException) and reaches the caller as a 500.
     """
     # Create a mock request with form data containing invalid JSON metadata
     mock_request = MagicMock()
@@ -292,9 +296,14 @@ async def test_form_data_with_invalid_json_metadata():
     mock_request.scope = {}
     mock_request.state._cached_headers = None
 
-    # Should raise JSONDecodeError when trying to parse invalid JSON metadata
-    with pytest.raises(json.JSONDecodeError):
+    # Should raise a 400 naming the field that could not be parsed
+    with pytest.raises(ProxyException) as exc_info:
         await _read_request_body(mock_request)
+
+    # ProxyException stores the code as a string; the proxy's exception handler
+    # converts it back with int(exc.code) when it builds the response.
+    assert int(exc_info.value.code) == 400
+    assert exc_info.value.param == "metadata"
 
 
 @pytest.mark.asyncio
@@ -1415,3 +1424,48 @@ async def test_auth_body_read_and_trace_handler_leave_stream_for_receiver_limit(
     assert response.status_code == 413
     assert receive.await_count == 2
     storage.ingest.assert_not_awaited()
+
+
+@pytest.mark.parametrize("empty_metadata", ["", "   "])
+@pytest.mark.asyncio
+async def test_form_data_with_empty_metadata_is_left_as_sent(empty_metadata):
+    """
+    An empty metadata field means the caller sent nothing.
+
+    It is left as-is rather than rejected, which is how the JSON branch already
+    treats ``"metadata": ""``.
+    """
+    mock_request = MagicMock()
+
+    test_data = {"model": "whisper-1", "file": "audio.mp3", "metadata": empty_metadata}
+
+    mock_request.form = AsyncMock(return_value=FormData(test_data))
+    mock_request.headers = {"content-type": "multipart/form-data"}
+    mock_request.scope = {}
+    mock_request.state._cached_headers = None
+
+    result = await _read_request_body(mock_request)
+
+    assert result["metadata"] == empty_metadata
+    assert result["model"] == "whisper-1"
+
+
+@pytest.mark.asyncio
+async def test_malformed_form_metadata_reaches_auth_as_a_deferred_400():
+    """
+    The auth pre-read parses the body before identity is resolved and only
+    catches ProxyException, so that it can run auth and log the failure before
+    the 400 goes out. A parse error of any other type escapes that and hits the
+    caller as a 500 instead.
+    """
+    from litellm.proxy.auth.user_api_key_auth import _read_request_body_deferring_parse_failure
+
+    body = b"model=whisper-1&metadata=%7B%22broken%22"
+    request = _starlette_request(body, "application/x-www-form-urlencoded")
+
+    request_data, parse_error = await _read_request_body_deferring_parse_failure(request=request)
+
+    assert request_data == {}
+    assert parse_error is not None
+    assert int(parse_error.code) == 400
+    assert parse_error.param == "metadata"
