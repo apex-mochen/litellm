@@ -1149,6 +1149,30 @@ def sanitize_input_schema_for_anthropic(input_schema: dict) -> "AnthropicInputSc
     if "properties" not in normalized:
         normalized["properties"] = {}
 
+    # Pydantic TypeAdapter(Union[...]).json_schema() emits root-level
+    # `anyOf` (over $defs) with no own properties. Without this merge, the
+    # sanitized tool schema reaches Anthropic as an empty object, silently
+    # dropping the union.
+    for combinator in ("anyOf", "oneOf", "allOf"):
+        branches = normalized.get(combinator)
+        if isinstance(branches, list):
+            merged_props = dict(normalized.get("properties") or {})
+            required = list(normalized.get("required") or [])
+            for branch in branches:
+                if isinstance(branch, dict):
+                    bp = branch.get("properties")
+                    if isinstance(bp, dict):
+                        merged_props.update(bp)
+                    br = branch.get("required")
+                    if isinstance(br, list):
+                        for name in br:
+                            if name not in required:
+                                required.append(name)
+            if merged_props:
+                normalized["properties"] = merged_props
+                if required:
+                    normalized["required"] = required
+
     normalized = unpack_legacy_defs(normalized, copy=True)
 
     allowed_keys: Final = set(AnthropicInputSchema.__annotations__.keys())
@@ -1989,26 +2013,6 @@ def is_encrypted_reasoning_block(block: object) -> bool:
     return _carries_encrypted_reasoning(_encrypted_reasoning_field(mapping))
 
 
-def is_unsignable_thinking_block(block: object) -> bool:
-    """A thinking block Anthropic cannot accept on input.
-
-    Anthropic verifies the thinking signature cryptographically, so a block whose
-    signature is null, empty, or missing (e.g. from an open-source reasoning model)
-    is rejected with a 400 and must be dropped rather than blanked or repaired, and
-    so is a block whose signature or data carries another provider's encrypted
-    reasoning. A `redacted_thinking` block Anthropic minted is always kept.
-    """
-    if is_encrypted_reasoning_block(block):
-        return True
-    if not isinstance(block, Mapping):
-        return False
-    mapping: Final = cast(Mapping[str, object], block)  # cast-ok: narrowed by isinstance
-    if mapping.get("type") != "thinking":
-        return False
-    signature: Final = mapping.get("signature")
-    return not (isinstance(signature, str) and len(signature) > 0)
-
-
 def strip_encrypted_reasoning_from_messages(messages: object) -> None:
     """Drop the bridge-tagged reasoning blocks a routed deployment cannot decrypt from
     Anthropic-shaped history.
@@ -2023,11 +2027,11 @@ def strip_encrypted_reasoning_from_messages(messages: object) -> None:
     """
     if not isinstance(messages, list):
         return
-    for content in anthropic_content_lists(cast(list[object], messages)):  # cast-ok: untyped client json
+    for content in _anthropic_content_lists(cast(list[object], messages)):  # cast-ok: untyped client json
         _strip_encrypted_reasoning_from_blocks(content)
 
 
-def anthropic_content_lists(messages: Sequence[object]) -> Iterator[object]:
+def _anthropic_content_lists(messages: Sequence[object]) -> Iterator[object]:
     return (
         cast(list[object], content)  # cast-ok: narrowed by isinstance
         for message in messages
