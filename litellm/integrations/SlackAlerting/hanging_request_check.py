@@ -131,6 +131,15 @@ class AlertingHangingRequestCheck:
                 # so a later check can alert if it never completes
                 continue
 
+            # request_status marker TTL is alerting_threshold + 100s. If by now
+            # the marker is still missing, the request almost certainly completed
+            # long ago and the marker expired while this tracker entry was still
+            # queued behind MAX_OLDEST_HANGING_REQUESTS_TO_CHECK. Drop it silently
+            # instead of raising a false "hanging" alert.
+            if request_age_seconds > self.slack_alerting_object.alerting_threshold + 100:
+                self.hanging_request_cache._remove_key(key=request_id)
+                continue
+
             ################
             # Send the Alert on Slack
             ################
