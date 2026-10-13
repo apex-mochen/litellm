@@ -4830,3 +4830,87 @@ def test_get_session_iterator_reuses_one_session_per_background_loop(
     assert len(sessions) == 10
     assert all(session is sessions[0] for session in sessions)
     assert presidio_guardrail._http_session is None
+
+
+# ---------------------------------------------------------------------------
+# Fix: Anthropic SSE streaming unmask kept PII placeholders un-restored
+# ---------------------------------------------------------------------------
+
+
+def test_output_parse_pii_declares_mask_response_content():
+    """
+    Regression test: output_parse_pii / apply_to_output / restore roles rewrite
+    the streamed response, so the guardrail must declare ``mask_response_content``.
+    Without it, Anthropic ``/v1/messages`` SSE streams (a non-OpenAI route that
+    requires guardrail translation) were routed through the unified guardrail
+    hook with ``streaming_transform_mode='block_only'``, which drops text
+    rewrites and let PII placeholders reach the client un-restored.
+    """
+    unmask = OPTIONAL_PresidioPIIMasking(mock_testing=True, output_parse_pii=True)
+    assert unmask.mask_response_content is True
+
+    mask = OPTIONAL_PresidioPIIMasking(mock_testing=True, apply_to_output=True)
+    assert mask.mask_response_content is True
+
+    restore = OPTIONAL_PresidioPIIMasking(
+        mock_testing=True, output_parse_pii=True, _callback_role="restore"
+    )
+    assert restore.mask_response_content is True
+
+    plain = OPTIONAL_PresidioPIIMasking(mock_testing=True)
+    assert plain.mask_response_content is False
+
+
+def test_unmask_pii_text_truncation_fallback_can_be_disabled():
+    """
+    Mid-stream deltas must not apply the max_tokens truncation fallback: a token
+    split across chunk boundaries is not truncated, and replacing the partial
+    suffix at every delta boundary corrupts the final output.
+    """
+    pii_tokens = {"<PERSON_1>": "Jane Smith"}
+    tail = "Hi <PERSON_"
+    assert (
+        OPTIONAL_PresidioPIIMasking._unmask_pii_text(tail, pii_tokens, apply_truncation_fallback=False) == tail
+    )
+    assert OPTIONAL_PresidioPIIMasking._unmask_pii_text(tail, pii_tokens) == "Hi Jane Smith"
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sse_unmask_joins_split_token_across_chunks():
+    """
+    A text delta line split across two bytes chunks ('<PERS' + 'ON_1>') must be
+    re-attached and restored once, instead of corrupting the tail.
+    """
+    guardrail = OPTIONAL_PresidioPIIMasking(mock_testing=True, output_parse_pii=True)
+    request_data = {"metadata": {"pii_tokens": {"<PERSON_1>": "Jane Smith"}}}
+
+    async def stream():
+        yield b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi <PERS'
+        yield b'ON_1>!"}}\n\n'
+
+    chunks = [c async for c in guardrail._stream_pii_unmasking(stream(), request_data)]
+    assert len(chunks) == 1
+    assert b"Hi Jane Smith!" in chunks[0]
+
+
+@pytest.mark.asyncio
+async def test_anthropic_sse_unmask_applies_truncation_fallback_only_at_stream_end():
+    """
+    The truncation fallback must only run on the final tail once the stream
+    ends; intermediate deltas that merely end mid-token stay untouched.
+    """
+    guardrail = OPTIONAL_PresidioPIIMasking(mock_testing=True, output_parse_pii=True)
+    request_data = {"metadata": {"pii_tokens": {"<PERSON_1>": "Jane Smith"}}}
+
+    async def stream():
+        yield b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"Hi <PERS'
+        yield b'ON_1>!"}}\n\n'
+        # Real stream-end tail: the SSE event JSON is complete, but the text
+        # delta value ends inside the token prefix (max_tokens cut).
+        yield b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":" and more <PERSON_"}}'
+
+    chunks = [c async for c in guardrail._stream_pii_unmasking(stream(), request_data)]
+    # Split token joined and restored in the first emitted chunk.
+    assert any(b"Hi Jane Smith!" in c for c in chunks)
+    # The real stream-end tail gets the truncation fallback.
+    assert any(b" and more Jane Smith" in c for c in chunks)

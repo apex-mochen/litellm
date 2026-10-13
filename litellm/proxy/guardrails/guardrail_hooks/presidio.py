@@ -225,6 +225,18 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         self.apply_to_output = apply_to_output
         self._callback_role = _callback_role
 
+        # This guardrail rewrites streamed output (mask via apply_to_output, or
+        # restore via output_parse_pii).  ``mask_response_content`` is the proxy
+        # dispatcher's signal that the response content is transformed: without
+        # it, Anthropic ``/v1/messages`` SSE streams (a non-OpenAI route that
+        # requires guardrail translation) are routed through the unified
+        # guardrail hook with ``streaming_transform_mode="block_only"``, which
+        # drops text rewrites -- so PII placeholders reached the client
+        # un-restored.  Declaring it keeps the guardrail's native
+        # ``async_post_call_streaming_iterator_hook`` on the stream.
+        if self.output_parse_pii or self.apply_to_output or _callback_role == "restore":
+            self.mask_response_content = True
+
         # When output_parse_pii or apply_to_output is enabled, the guardrail must
         # also run on post_call to unmask/mask the response.  Expand the event_hook
         # so should_run_guardrail returns True for both pre_call and post_call.
@@ -1248,7 +1260,11 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         return response
 
     @staticmethod
-    def _unmask_pii_text(text: str, pii_tokens: dict[str, str]) -> str:
+    def _unmask_pii_text(
+        text: str,
+        pii_tokens: dict[str, str],
+        apply_truncation_fallback: bool = True,
+    ) -> str:
         """
         Replace PII tokens in *text* with their original values.
 
@@ -1258,11 +1274,18 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         original value.  The minimum overlap length is
         ``min(20, len(token) // 2)`` to reduce the risk of false positives
         when multiple tokens share a common prefix.
+
+        ``apply_truncation_fallback`` should be disabled while processing
+        *intermediate* chunks of a stream: a token that is only split across
+        chunk boundaries (e.g. ``<PERS`` then ``ON_1>``) is not truncated, and
+        replacing the partial suffix mid-stream corrupts the final output.
+        The caller must re-apply the fallback to the final tail once the
+        stream actually ends.
         """
         for token, original_text in pii_tokens.items():
             if token in text:
                 text = text.replace(token, original_text)
-            else:
+            elif apply_truncation_fallback:
                 # FALLBACK: Handle truncated tokens (token cut off by max_tokens)
                 # Only check at the very end of the text.
                 min_overlap = min(20, len(token) // 2)
@@ -1526,7 +1549,27 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
         return anthropic_sse_chunks_from_response(assembled)
 
     @staticmethod
-    def _unmask_sse_bytes_chunk(chunk: bytes, pii_tokens: dict[str, str]) -> bytes:
+    def _decode_sse_chunk(chunk: bytes) -> str | None:
+        """Decode an SSE transport chunk; ``None`` means the payload is not UTF-8."""
+        try:
+            return chunk.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+
+    @staticmethod
+    def _split_sse_lines(combined: str) -> tuple[str, str]:
+        """Split *combined* into complete lines and the trailing partial line."""
+        if combined.endswith("\n"):
+            return combined, ""
+        head, _, tail = combined.rpartition("\n")
+        return (head + "\n" if head else ""), tail
+
+    @staticmethod
+    def _unmask_sse_bytes_chunk(
+        chunk: bytes,
+        pii_tokens: dict[str, str],
+        apply_truncation_fallback: bool = False,
+    ) -> bytes:
         try:
             text: Final = chunk.decode("utf-8")
         except UnicodeDecodeError:
@@ -1546,7 +1589,9 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                         and delta.get("type") == "text_delta"
                         and isinstance(delta.get("text"), str)
                     ):
-                        unmasked = OPTIONAL_PresidioPIIMasking._unmask_pii_text(delta["text"], pii_tokens)
+                        unmasked = OPTIONAL_PresidioPIIMasking._unmask_pii_text(
+                            delta["text"], pii_tokens, apply_truncation_fallback=apply_truncation_fallback
+                        )
                         if unmasked != delta["text"]:
                             event["delta"]["text"] = unmasked
                             line = "data: " + json.dumps(event, ensure_ascii=False)
@@ -1579,7 +1624,32 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                 elif hasattr(content_block, "text") and isinstance(content_block.text, str):
                     content_block.text = self._unmask_pii_text(content_block.text, pii_tokens)
 
-    async def _stream_pii_unmasking(
+    async def _flush_sse_tail(
+        self,
+        tail: str,
+        pii_tokens: dict[str, str],
+        apply_truncation_fallback: bool,
+    ) -> AsyncGenerator[object, None]:
+        """Yield the pending partial SSE line, with or without the max_tokens fallback."""
+        if tail:
+            yield self._unmask_sse_bytes_chunk(
+                tail.encode("utf-8"),
+                pii_tokens,
+                apply_truncation_fallback=apply_truncation_fallback,
+            )
+
+    async def _flush_buffered_chunks(self, chunks: list[ModelResponseStream]) -> AsyncGenerator[object, None]:
+        """Yield buffered chat chunks unmasked (mixed stream passthrough)."""
+        for buffered_chunk in chunks:
+            yield buffered_chunk
+
+    def _unmask_responses_event(self, chunk: object, pii_tokens: dict[str, str]) -> None:
+        """Unmask a Responses API ``response.completed`` / ``response.incomplete`` event in-place."""
+        chunk_type = getattr(chunk, "type", None)
+        if chunk_type in ("response.completed", "response.incomplete") and pii_tokens:
+            self._unmask_responses_api_completed_chunk(chunk, pii_tokens)
+
+    async def _stream_pii_unmasking(  # noqa: C901  # dispatch state machine: chat/bytes/responses shapes + three tail-flush paths; helpers above already absorb the per-shape logic
         self,
         response: AsyncIterable[object],
         request_data: dict,
@@ -1596,6 +1666,14 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
 
         remaining_chunks: list[ModelResponseStream] = []
         saw_non_chat_chunk = False
+        # Anthropic native SSE arrives as raw bytes.  A ``data:`` line (and the
+        # text delta inside it) may be split across chunks, so keep the trailing
+        # partial line here and re-attach it to the next chunk.  This guarantees
+        # the truncation fallback in ``_unmask_pii_text`` is only applied once
+        # the stream actually ends -- applying it at every delta boundary
+        # corrupted split tokens such as ``<PERS`` + ``ON_1>`` into
+        # ``Jane SmithON_1>``.
+        pending_sse_tail: str = ""
         try:
             async for chunk in response:
                 if isinstance(chunk, ModelResponseStream):
@@ -1604,29 +1682,53 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
                     else:
                         remaining_chunks.append(chunk)
                 elif isinstance(chunk, bytes):
-                    if pii_tokens:
-                        yield self._unmask_sse_bytes_chunk(chunk, pii_tokens)
-                    else:
+                    if not pii_tokens:
                         yield chunk
+                        continue
+                    decoded = self._decode_sse_chunk(chunk)
+                    if decoded is None:
+                        # Keep the original passthrough behaviour for
+                        # undecodable payloads.
+                        yield chunk
+                        continue
+                    complete_lines, pending_sse_tail = self._split_sse_lines(pending_sse_tail + decoded)
+                    if complete_lines:
+                        yield self._unmask_sse_bytes_chunk(
+                            complete_lines.encode("utf-8"),
+                            pii_tokens,
+                            apply_truncation_fallback=False,
+                        )
                     continue
                 else:
                     # /v1/responses events: unmask response.completed text in-place.
                     # A mixed stream can't be reassembled, so flush buffered chat
                     # chunks in order before passthrough instead of dropping them.
                     if remaining_chunks and not saw_non_chat_chunk:
-                        for buffered_chunk in remaining_chunks:
+                        async for buffered_chunk in self._flush_buffered_chunks(remaining_chunks):
                             yield buffered_chunk
                         remaining_chunks = []
-                    chunk_type = getattr(chunk, "type", None)
-                    if chunk_type in ("response.completed", "response.incomplete") and pii_tokens:
-                        self._unmask_responses_api_completed_chunk(chunk, pii_tokens)
+                    self._unmask_responses_event(chunk, pii_tokens)
                     saw_non_chat_chunk = True
                     yield chunk
 
             if saw_non_chat_chunk:
+                # Mixed stream: flush the partial SSE line without the
+                # truncation fallback (this is not a clean chat stream whose
+                # tail is a genuine max_tokens cut).
+                async for flushed in self._flush_sse_tail(
+                    pending_sse_tail, pii_tokens, apply_truncation_fallback=False
+                ):
+                    yield flushed
                 return
 
             if not remaining_chunks:
+                if pending_sse_tail:
+                    # Pure bytes stream: this is the real end of the stream, so
+                    # a token suffix truncated by max_tokens is safely restored.
+                    async for flushed in self._flush_sse_tail(
+                        pending_sse_tail, pii_tokens, apply_truncation_fallback=True
+                    ):
+                        yield flushed
                 return
 
             assembled_model_response: Final = stream_chunk_builder(
@@ -1651,6 +1753,14 @@ class _OPTIONAL_PresidioPIIMasking(CustomGuardrail):
 
         except Exception as e:
             verbose_proxy_logger.error("Error in PII streaming processing: %s", e)
+            if pending_sse_tail:
+                # Stream aborted mid-line: flush the partial SSE tail without
+                # the truncation fallback (the tail is not a genuine
+                # max_tokens cut here).
+                async for flushed in self._flush_sse_tail(
+                    pending_sse_tail, pii_tokens, apply_truncation_fallback=False
+                ):
+                    yield flushed
             for chunk in remaining_chunks:
                 yield chunk
 
